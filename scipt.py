@@ -1,67 +1,116 @@
 #!/usr/bin/env python3
-import argparse
-import json
-import os
-import sys
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+import argparse, json, sys
+from typing import Any, Dict, List, Set
+import requests, pandas as pd
 
-import requests
-import pandas as pd
+def fetch(url: str, headers: Dict[str, str], verify_tls: bool = True, timeout: int = 30) -> Any:
+    r = requests.get(url, headers=headers, verify=verify_tls, timeout=timeout)
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        print(f"[ERROR] Netskope API {r.status_code}: {r.text}", file=sys.stderr)
+        raise
+    return r.json()
 
-
-def fetch_all_pages(
-    url: str,
-    headers: Dict[str, str],
-    verify_tls: bool = True,
-    timeout: int = 30,
-    pagination_param: Optional[str] = None,
-    next_cursor_path: Optional[List[str]] = None,
-    per_page_param: Optional[Tuple[str, str]] = None,
-) -> List[Dict[str, Any]]:
+def extract_items(payload: Any) -> List[Dict[str, Any]]:
     """
-    Fetch JSON from Netskope endpoint; supports cursor/offset style pagination if configured.
-
-    Args:
-      url: full API URL to list private apps
-      headers: auth headers
-      pagination_param: query parameter name for cursor/offset (e.g., "cursor", "page")
-      next_cursor_path: JSON path to read the "next" cursor from response (e.g., ["meta","next"])
-      per_page_param: (key, value) to request bigger pages if API supports (e.g., ("limit","1000"))
-
-    Returns:
-      List of response objects (each page as dict). If pagination is not configured, returns one item list.
+    Find the list of app objects in common response shapes.
     """
-    pages: List[Dict[str, Any]] = []
-    session = requests.Session()
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "items", "result", "private_apps", "applications"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                return v
+        # fallback: first list of dicts
+        for v in payload.values():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                return v
+    return []
 
-    params: Dict[str, str] = {}
-    if per_page_param:
-        k, v = per_page_param
-        params[k] = v
+def harvest_hosts(obj: Any) -> Set[str]:
+    """
+    Collect destination hostnames/domains from typical fields:
+      - direct: fqdn, hostname, host, domain, destination, destination_fqdn
+      - containers: destinations, resources (and their children)
+    """
+    out: Set[str] = set()
+    def walk(v: Any):
+        if v is None:
+            return
+        if isinstance(v, str):
+            s = v.strip()
+            if s: out.add(s)
+            return
+        if isinstance(v, list):
+            for x in v: walk(x)
+            return
+        if isinstance(v, dict):
+            # leaf-ish keys
+            for k in ("fqdn","hostname","host","domain","destination","destination_fqdn"):
+                if k in v: walk(v[k])
+            # container-ish keys
+            for k in ("destinations","resources","domains"):
+                if k in v: walk(v[k])
+            # scan remaining children
+            for vv in v.values():
+                if isinstance(vv, (dict, list, str)): walk(vv)
+    walk(obj)
+    return out
 
-    cursor: Optional[str] = None
-    while True:
-        req_params = dict(params)
-        if pagination_param and cursor:
-            req_params[pagination_param] = cursor
+def row_from_app(app: Dict[str, Any]) -> Dict[str, str]:
+    # App name: prioritize 'app_name'
+    name = ""
+    for k in ("app_name", "name", "application_name", "display_name", "label"):
+        if isinstance(app.get(k), str) and app[k].strip():
+            name = " ".join(app[k].split()).strip()
+            break
 
-        resp = session.get(url, headers=headers, params=req_params, timeout=timeout, verify=verify_tls)
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as e:
-            raise SystemExit(f"[ERROR] Netskope API error {resp.status_code}: {resp.text}") from e
+    # App ID if present
+    app_id = ""
+    for k in ("id","app_id","uuid","guid"):
+        if k in app and app[k] is not None:
+            app_id = str(app[k]); break
 
-        data = resp.json()
-        pages.append(data)
+    # Hosts
+    hosts = sorted({ " ".join(h.split()).strip() for h in harvest_hosts(app) if h })
+    return {
+        "Application Name": name,
+        "Destination Hostnames": ", ".join(hosts),
+        "App ID": app_id
+    }
 
-        if not pagination_param or not next_cursor_path:
-            break  # single page
-        # Walk JSON to find next cursor
-        nxt = data
-        for key in next_cursor_path:
-            if isinstance(nxt, dict) and key in nxt:
-                nxt = nxt[key]
-            else:
+def main():
+    ap = argparse.ArgumentParser(description="Export Netskope NPA Private Applications to CSV (uses app_name).")
+    ap.add_argument("--url", required=True, help="Full Netskope API URL to list NPA private apps.")
+    ap.add_argument("--token", required=True, help="Token value. If using Bearer, include 'Bearer ...'.")
+    ap.add_argument("--token-header", default="Netskope-Api-Token",
+                   help='Header name for token (default Netskope-Api-Token; use "Authorization" for Bearer).')
+    ap.add_argument("--out-csv", default="netskope_npa_private_apps.csv", help="CSV output path.")
+    ap.add_argument("--raw-json", default=None, help="Optional: save raw JSON to this path.")
+    ap.add_argument("--insecure", action="store_true", help="Disable TLS verification.")
+    args = ap.parse_args()
+
+    headers = {args.token_header: args.token}
+    payload = fetch(args.url, headers, verify_tls=not args.insecure)
+
+    if args.raw_json:
+        with open(args.raw_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    items = extract_items(payload)
+    if not items:
+        print("[WARN] No app list found in response. Adjust extract_items() for your endpoint.", file=sys.stderr)
+
+    rows = [row_from_app(app) for app in items]
+    df = pd.DataFrame(rows, columns=["Application Name","Destination Hostnames","App ID"])
+    df = df.sort_values(by="Application Name", key=lambda s: s.str.lower(), kind="mergesort")
+    df.to_csv(args.out_csv, index=False)
+    print(f"Exported {len(df)} apps to {args.out_csv}")
+
+if __name__ == "__main__":
+    main()
                 nxt = None
                 break
         # Stop if no next cursor
